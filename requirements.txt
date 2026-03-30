@@ -1,10 +1,24 @@
-streamlit
-requests
-faster-whisper
-streamlit-mic-recorder
-python-dotenv
-streamlit
-requests
-speechrecognition
-plotly
-pandas
+# BEI Cape — Python dependencies
+# Generated for Claude API deployment (v3)
+
+# Core Anthropic SDK — replaces Ollama
+anthropic>=0.40.0
+
+# Web UI
+streamlit>=1.35.0
+
+# Text-to-speech (candidate voice)
+edge-tts>=6.1.9
+
+# Speech recognition (interviewer voice input)
+SpeechRecognition>=3.10.0
+
+# Data
+pandas>=2.0.0
+openpyxl>=3.1.0
+
+# Visualisation (assessor portal)
+plotly>=5.18.0
+
+# Audio processing (for sr.AudioFile)
+PyAudio>=0.2.14
