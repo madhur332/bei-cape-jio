@@ -1,7 +1,7 @@
 # BEI Cape — Python dependencies
-# Generated for Claude API deployment (v3)
+# Claude API deployment (v3) — Streamlit Cloud compatible
 
-# Core Anthropic SDK — replaces Ollama
+# Core Anthropic SDK
 anthropic>=0.40.0
 
 # Web UI
@@ -19,6 +19,3 @@ openpyxl>=3.1.0
 
 # Visualisation (assessor portal)
 plotly>=5.18.0
-
-# Audio processing (for sr.AudioFile)
-PyAudio>=0.2.14
