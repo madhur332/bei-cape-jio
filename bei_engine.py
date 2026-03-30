@@ -1,8 +1,13 @@
 # bei_engine.py
-# BEI Cape — Core Engine v2
+# BEI Cape — Core Engine v3
 # Fixes: controlled "we" pronoun, randomness/human-like responses, rubric-based scoring,
 #         competency addressed vs not addressed, gender-aware TTS voice mapping,
-#         small-talk handling, dynamic feedback
+#         small-talk handling, dynamic feedback,
+#         competency coverage ranking by STAR framework (Excel rubric),
+#         small-talk strict isolation (candidate never answers about work during small talk)
+# v3: Replaced OllamaClient → AnthropicClient (Claude API)
+#     Candidate turns  → claude-haiku-4-5-20251001 (fast, cost-efficient)
+#     Report scoring   → claude-sonnet-4-6 (higher reasoning quality)
 
 import os
 import json
@@ -12,11 +17,15 @@ import random
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 
-import requests
+import anthropic
 
 
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
-MODEL_NAME = os.getenv("MODEL_NAME", "qwen2.5:7b")
+# Anthropic model config
+# Haiku: fast + cheap → candidate responses
+# Sonnet: smarter   → report evaluation
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+CANDIDATE_MODEL = os.getenv("CANDIDATE_MODEL", "claude-haiku-4-5-20251001")
+EVALUATOR_MODEL = os.getenv("EVALUATOR_MODEL", "claude-sonnet-4-6")
 SESSIONS_DIR = os.getenv("SESSIONS_DIR", "sessions")
 PERSONA_DIR = os.getenv("PERSONA_DIR", "persona_store")
 
@@ -25,7 +34,162 @@ os.makedirs(PERSONA_DIR, exist_ok=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# COMPETENCY RUBRIC (from Excel)
+# BEHAVIORAL COMPETENCY RUBRIC (from Excel — used for coverage ranking)
+# These are the 6 competencies the interviewer is judged on covering.
+# ─────────────────────────────────────────────────────────────────────────────
+
+BEHAVIORAL_COMPETENCIES = {
+    "first_principles_thinking": {
+        "label": "First Principles Thinking",
+        "description": "Creating new and better ways for the organization to be successful by looking for breakthrough solutions rather than relying on assumptions or legacy.",
+        "indicators": [
+            "breaks complex problems into foundational elements",
+            "questions legacy assumptions",
+            "designs novel solutions",
+            "connects abstract ideas to tangible business challenges",
+            "reframe problems from multiple perspectives",
+            "first principles",
+            "assumptions",
+            "breakthrough",
+            "root cause",
+            "fundamental",
+        ],
+        "levels": {
+            4: "Operates as a catalyst for original thinking. Anticipates embedded assumptions and reframes them. Coaches others to build logic from the ground up.",
+            3: "Consistently applies structured, logic-driven analysis. Breaks down complex challenges into core elements and challenges legacy thinking when needed.",
+            2: "Demonstrates some willingness to question existing methods but struggles to structure thinking independently.",
+            1: "Accepts legacy processes at face value, showing limited curiosity about underlying logic.",
+        }
+    },
+    "owner_mindset": {
+        "label": "Owner Mindset",
+        "description": "Demonstrating courage and accountability to achieve bold goals, with strong commercial acumen and market understanding.",
+        "indicators": [
+            "owns end-to-end outcomes",
+            "accountability",
+            "bold decisions",
+            "commercial",
+            "resilience",
+            "market",
+            "financial performance",
+            "holds self and others accountable",
+            "ownership",
+            "responsible",
+            "risk",
+            "results",
+        ],
+        "levels": {
+            4: "Role models entrepreneurial ownership and commercial thinking. Makes bold, well-judged decisions that drive significant value.",
+            3: "Demonstrates strong personal accountability for both decisions and outcomes. Proactively considers financial and strategic impact.",
+            2: "Takes responsibility for own tasks but may require direction to manage end-to-end outcomes.",
+            1: "Avoids ownership of outcomes; deflects accountability or blames external factors.",
+        }
+    },
+    "agility": {
+        "label": "Agility",
+        "description": "Willingness and ability to learn, unlearn, and adapt quickly to changing situations to deliver meaningful outcomes.",
+        "indicators": [
+            "changes direction quickly",
+            "learns and unlearns",
+            "adapt",
+            "low-cost innovations",
+            "new technologies",
+            "continuous experimentation",
+            "iterative learning",
+            "pivot",
+            "flexibility",
+            "ambiguity",
+            "change",
+            "digital",
+        ],
+        "levels": {
+            4: "Anticipates shifts and proactively reshapes direction with speed and precision. Champions digital transformation and cost discipline.",
+            3: "Adjusts strategies and execution models in real-time based on data, context, or constraints.",
+            2: "Acknowledges the need for flexibility but adapts slowly or reactively.",
+            1: "Struggles in dynamic environments; clings to established routines.",
+        }
+    },
+    "collaboration": {
+        "label": "Collaboration",
+        "description": "Building partnerships and working collaboratively across internal and external boundaries to achieve business goals.",
+        "indicators": [
+            "builds strong networks",
+            "resolves conflicts",
+            "involves relevant stakeholders",
+            "builds coalitions",
+            "actively listens",
+            "cross-functional",
+            "partnership",
+            "alignment",
+            "stakeholder",
+            "team work",
+            "together",
+            "coalition",
+        ],
+        "levels": {
+            4: "Orchestrates seamless collaboration across complex stakeholder networks. Aligns competing agendas into unified action.",
+            3: "Actively builds alignment across functions and hierarchies to drive shared results.",
+            2: "Participates in cross-functional efforts when required, but does not actively drive alignment.",
+            1: "Operates in silos or prioritizes functional wins over enterprise outcomes.",
+        }
+    },
+    "operational_excellence": {
+        "label": "Operational Excellence",
+        "description": "Deep understanding of business operations and processes to build a future-ready, efficient organization.",
+        "indicators": [
+            "understands and improves systems",
+            "anticipates execution risks",
+            "rigor",
+            "discipline",
+            "transparency",
+            "aligns processes",
+            "data and feedback loops",
+            "process",
+            "efficiency",
+            "workflow",
+            "operations",
+            "controls",
+            "improvement",
+            "metrics",
+        ],
+        "levels": {
+            4: "Thinks like a process architect — simplifying complexity, institutionalizing discipline, and unlocking productivity at scale.",
+            3: "Designs and refines end-to-end processes that deliver measurable improvement in quality, speed, or cost.",
+            2: "Applies basic process discipline within own scope. Identifies improvement areas but lacks system-level visibility.",
+            1: "Executes without understanding upstream or downstream impact. Misses critical controls or redundancies.",
+        }
+    },
+    "build_and_manage_teams": {
+        "label": "Build and Manage Teams",
+        "description": "Creating and leading high-performing, diverse teams united by common goals and strong team identity.",
+        "indicators": [
+            "builds teams",
+            "performance",
+            "inclusion",
+            "learning",
+            "coaching",
+            "development plans",
+            "feedback loops",
+            "aligns team goals",
+            "succession",
+            "leadership",
+            "high-performing",
+            "talent",
+            "culture",
+            "team identity",
+        ],
+        "levels": {
+            4: "Shapes teams that are self-driven, growth-oriented, and succession-ready. Acts as a leadership multiplier.",
+            3: "Builds purpose-driven teams with role clarity, performance rigor, and trust. Coaches talent and drives accountability.",
+            2: "Maintains team structure and manages basic delivery. Supports individuals tactically.",
+            1: "Treats team as a collection of individuals rather than a cohesive unit. Avoids difficult feedback.",
+        }
+    },
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INTERVIEWER ASSESSMENT RUBRIC (8 parameters — used to score the interviewer)
 # ─────────────────────────────────────────────────────────────────────────────
 
 COMPETENCY_RUBRIC = {
@@ -128,15 +292,11 @@ PARAMETER_LABELS = {k: v["label"] for k, v in COMPETENCY_RUBRIC.items()}
 # ─────────────────────────────────────────────────────────────────────────────
 
 PERSONA_VOICE_MAP = {
-    # Female voices — clear, natural pronunciation
     "priya": "en-IN-NeerjaNeural",
     "sarah": "en-US-AriaNeural",
     "fatima": "en-US-AriaNeural",
     "elena": "en-US-JennyNeural",
     "nadia": "en-US-AriaNeural",
-    # Male voices — en-US-AndrewNeural and en-US-ChristopherNeural
-    # have the clearest pronunciation, matching female voice quality.
-    # Avoid GuyNeural and PrabhatNeural which have poorer articulation.
     "arjun": "en-US-AndrewNeural",
     "liang": "en-US-ChristopherNeural",
     "marcus": "en-US-ChristopherNeural",
@@ -146,22 +306,18 @@ PERSONA_VOICE_MAP = {
 
 
 def get_tts_voice_for_persona(persona_name: str) -> str:
-    """Return the correct gendered TTS voice based on persona name."""
     name_lower = (persona_name or "").lower()
     for key, voice in PERSONA_VOICE_MAP.items():
         if key in name_lower:
             return voice
-    # Default: neutral female
     return "en-US-AriaNeural"
 
 
 def is_male_voice(voice: str) -> bool:
-    """Check if a voice is male."""
     male_voices = ["AndrewNeural", "ChristopherNeural", "GuyNeural", "PrabhatNeural"]
     return any(m in voice for m in male_voices)
 
 
-# Interviewer voice — used in assessor portal for playing back interviewer questions
 INTERVIEWER_TTS_VOICE = "en-US-JennyNeural"
 
 
@@ -175,21 +331,65 @@ SMALL_TALK_PATTERNS = [
     r"\bhow have you been\b", r"\btell me about yourself\b",
     r"\bintroduce yourself\b", r"\bwho are you\b", r"\byour name\b",
     r"\bnice to meet\b", r"\bgood morning\b", r"\bgood afternoon\b",
-    r"\bgood evening\b", r"\bhello\b", r"\bhi there\b",
+    r"\bgood evening\b", r"\bhello\b", r"\bhi there\b", r"\bhey\b",
     r"\bthank you for coming\b", r"\bthanks for joining\b",
     r"\bhow was your day\b", r"\bhow was your commute\b",
     r"\bare you comfortable\b", r"\bcan i get you\b",
     r"\bwould you like water\b", r"\bwould you like coffee\b",
     r"\brelax\b", r"\bsettle in\b", r"\bmake yourself comfortable\b",
+    r"\bwelcome\b", r"\bplease have a seat\b", r"\bgood to meet\b",
+    r"\bhope you found us okay\b", r"\bhope the journey\b",
+    r"\bfeeling nervous\b", r"\bare you ready\b",
+]
+
+# These patterns STRONGLY indicate behavioral questions — never treat as small talk
+BEHAVIORAL_OVERRIDE_PATTERNS = [
+    r"tell me about a time",
+    r"give me an example",
+    r"describe a situation",
+    r"walk me through",
+    r"can you share.*experience",
+    r"what happened when",
+    r"how did you handle",
+    r"have you ever faced",
+    r"recall a time",
+    r"think of a situation",
+    r"share an experience",
+    r"describe an instance",
+    r"when was a time",
+    r"what did you do when",
+    r"what was the challenge",
+    r"tell me.*situation",
+    r"give.*example.*time",
 ]
 
 
 def is_small_talk(text: str) -> bool:
-    """Detect if the interviewer's message is casual / small talk / ice-breaker."""
+    """
+    Detect if the interviewer's message is casual / small talk / ice-breaker.
+
+    STRICT RULE: If the message contains ANY behavioral question markers,
+    it is NOT small talk — even if it also contains greeting words.
+    This prevents 'Tell me about yourself and a time you faced a challenge'
+    from being misclassified as small talk.
+    """
     text_l = (text or "").lower().strip()
-    if len(text_l.split()) <= 2 and any(g in text_l for g in ["hi", "hello", "hey"]):
+
+    # Hard override: if it contains behavioral markers, it's NOT small talk
+    for pattern in BEHAVIORAL_OVERRIDE_PATTERNS:
+        if re.search(pattern, text_l):
+            return False
+
+    # Short greetings (1-3 words)
+    word_count = len(text_l.split())
+    if word_count <= 3 and any(g in text_l for g in ["hi", "hello", "hey", "morning", "afternoon", "evening"]):
         return True
-    return any(re.search(p, text_l) for p in SMALL_TALK_PATTERNS)
+
+    # Match small talk patterns
+    if any(re.search(p, text_l) for p in SMALL_TALK_PATTERNS):
+        return True
+
+    return False
 
 
 def is_behavioral_question(text: str) -> bool:
@@ -224,8 +424,6 @@ FILLER_STARTS = [
     "Okay so this one time...",
     "Right, so...",
 ]
-
-SMALL_TALK_REPLIES_DEPRECATED = []  # No longer used — all small talk goes through LLM for intelligent responses
 
 
 def random_filler() -> str:
@@ -318,7 +516,6 @@ def strip_candidate_followup_questions(text: str) -> str:
     if not text:
         return text
 
-    # Strip "good question" variants that LLMs love to add
     good_q_patterns = [
         r"(?i)^(that'?s?\s+a\s+)?good\s+question[.!,]?\s*",
         r"(?i)^great\s+question[.!,]?\s*",
@@ -365,7 +562,6 @@ def strip_candidate_followup_questions(text: str) -> str:
 
 
 def detect_personal_probe(text: str) -> bool:
-    """Detect if the interviewer is explicitly asking for personal/individual contribution."""
     text_l = (text or "").lower()
     personal_markers = [
         "what did you do", "your role", "your contribution", "you personally",
@@ -380,7 +576,6 @@ def detect_personal_probe(text: str) -> bool:
 
 
 def count_we_vs_i(text: str) -> Dict[str, int]:
-    """Count 'we'/'our'/'the team' vs 'I'/'my'/'me' in candidate response."""
     text_l = (text or "").lower()
     we_count = len(re.findall(r"\bwe\b|\bour\b|\bthe team\b|\bus\b", text_l))
     i_count = len(re.findall(r"\bi\b|\bmy\b|\bme\b|\bmyself\b", text_l))
@@ -388,11 +583,11 @@ def count_we_vs_i(text: str) -> Dict[str, int]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# COMPETENCY TRACKING
+# COMPETENCY TRACKING — STAR Framework
 # ─────────────────────────────────────────────────────────────────────────────
 
 def detect_competency_indicators(text: str) -> Dict[str, bool]:
-    """Detect which competency indicators are present in an interviewer question."""
+    """Detect which STAR components are present in an interviewer question."""
     text_l = (text or "").lower()
     indicators = {
         "situation_explored": any(w in text_l for w in [
@@ -421,6 +616,109 @@ def detect_competency_indicators(text: str) -> Dict[str, bool]:
         ]),
     }
     return indicators
+
+
+def detect_behavioral_competencies_touched(conversation: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """
+    Analyse the full conversation to determine which of the 6 behavioral
+    competencies (from the Excel rubric) were touched by the interviewer,
+    AND how many STAR components were covered for each.
+
+    Returns a dict keyed by competency_id with:
+      - label: display name
+      - touched: bool — was this competency mentioned at all
+      - star_components: dict of which STAR parts were covered while discussing this competency
+      - star_count: number of STAR components covered (0-6)
+      - star_completeness_pct: percentage of STAR components covered
+      - evidence: list of question snippets that touched this competency
+    """
+    # Build a combined picture per competency
+    result = {}
+    for comp_id, comp_data in BEHAVIORAL_COMPETENCIES.items():
+        result[comp_id] = {
+            "label": comp_data["label"],
+            "touched": False,
+            "star_components": {
+                "situation": False,
+                "task": False,
+                "action": False,
+                "result": False,
+                "learning": False,
+                "reasoning": False,
+            },
+            "star_count": 0,
+            "star_completeness_pct": 0,
+            "evidence": [],
+        }
+
+    # Iterate through interviewer messages
+    for msg in conversation:
+        if msg.get("role") != "interviewer":
+            continue
+
+        text = (msg.get("content") or "").lower()
+        star = detect_competency_indicators(text)
+
+        for comp_id, comp_data in BEHAVIORAL_COMPETENCIES.items():
+            # Check if any indicator for this competency appears in the question
+            indicators_hit = [ind for ind in comp_data["indicators"] if ind in text]
+
+            if indicators_hit:
+                result[comp_id]["touched"] = True
+                result[comp_id]["evidence"].append(msg.get("content", "")[:120])
+
+                # Credit STAR components that appeared in the same question
+                if star["situation_explored"]:
+                    result[comp_id]["star_components"]["situation"] = True
+                if star["task_explored"]:
+                    result[comp_id]["star_components"]["task"] = True
+                if star["action_explored"]:
+                    result[comp_id]["star_components"]["action"] = True
+                if star["result_explored"]:
+                    result[comp_id]["star_components"]["result"] = True
+                if star["learning_explored"]:
+                    result[comp_id]["star_components"]["learning"] = True
+                if star["reasoning_explored"]:
+                    result[comp_id]["star_components"]["reasoning"] = True
+
+    # Compute star_count and completeness for each competency
+    for comp_id in result:
+        star_count = sum(1 for v in result[comp_id]["star_components"].values() if v)
+        result[comp_id]["star_count"] = star_count
+        result[comp_id]["star_completeness_pct"] = round((star_count / 6) * 100)
+
+    return result
+
+
+def build_competency_coverage_ranking(competency_analysis: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Build an explicit ranking of competencies by number of STAR components touched.
+    Competencies not touched at all are ranked at the bottom.
+
+    Returns a sorted list (highest STAR coverage first) with rank, label, star_count,
+    star_completeness_pct, touched status, and which STAR parts were covered.
+    """
+    rows = []
+    for comp_id, data in competency_analysis.items():
+        rows.append({
+            "competency_id": comp_id,
+            "label": data["label"],
+            "touched": data["touched"],
+            "star_count": data["star_count"],
+            "star_completeness_pct": data["star_completeness_pct"],
+            "star_components": data["star_components"],
+            "evidence_count": len(data["evidence"]),
+            "evidence": data["evidence"],
+        })
+
+    # Sort: touched first, then by star_count descending, then alphabetically
+    rows.sort(key=lambda x: (0 if x["touched"] else 1, -x["star_count"], x["label"]))
+
+    # Assign rank
+    for i, row in enumerate(rows, 1):
+        row["rank"] = i
+
+    return rows
 
 
 class PersonaStore:
@@ -533,7 +831,6 @@ class SessionStore:
                 "small_talk_turns": 0,
                 "behavioral_questions": 0,
             },
-            # NEW: Track competency indicators across the interview
             "competency_indicators_accumulated": {
                 "situation_explored": False,
                 "task_explored": False,
@@ -542,7 +839,6 @@ class SessionStore:
                 "learning_explored": False,
                 "reasoning_explored": False,
             },
-            # NEW: Track we/I pronoun balance across candidate responses
             "pronoun_tracking": {
                 "total_we_count": 0,
                 "total_i_count": 0,
@@ -606,7 +902,6 @@ class SessionStore:
 
     @staticmethod
     def change_difficulty(session_id: str, new_difficulty: str) -> None:
-        """Change difficulty mid-session. Only works for active sessions."""
         if new_difficulty.lower() not in ("low", "medium", "high"):
             return
         session = SessionStore.load_session(session_id)
@@ -616,30 +911,60 @@ class SessionStore:
         SessionStore.save_session(session_id, session)
 
 
-class OllamaClient:
-    def __init__(self, base_url: str = OLLAMA_BASE_URL, model_name: str = MODEL_NAME):
-        self.base_url = base_url.rstrip("/")
-        self.model_name = model_name
-        # Reuse HTTP session for connection pooling — faster subsequent calls
-        self._session = requests.Session()
+class AnthropicClient:
+    """
+    Drop-in replacement for OllamaClient using the official Anthropic SDK.
 
-    def generate(self, prompt: str, temperature: float = 0.8, num_predict: int = 300) -> str:
-        url = f"{self.base_url}/api/generate"
-        payload = {
-            "model": self.model_name,
-            "prompt": prompt,
-            "stream": False,
-            "keep_alive": "10m",  # Keep model loaded in memory for 10 min
-            "options": {
-                "temperature": temperature,
-                "num_predict": num_predict,
-                "num_ctx": 2048,  # Smaller context window = faster inference
-            }
-        }
-        resp = self._session.post(url, json=payload, timeout=120)
-        resp.raise_for_status()
-        data = resp.json()
-        return (data.get("response") or "").strip()
+    Two models are used:
+      - CANDIDATE_MODEL (Haiku): fast, cheap — used for all candidate turn generation.
+      - EVALUATOR_MODEL (Sonnet): smarter — used only for final report scoring.
+
+    The `generate()` method mirrors the old OllamaClient signature so the rest
+    of BEIEngine requires zero changes.
+    """
+
+    def __init__(
+        self,
+        candidate_model: str = CANDIDATE_MODEL,
+        evaluator_model: str = EVALUATOR_MODEL,
+        api_key: str = ANTHROPIC_API_KEY,
+    ):
+        self.candidate_model = candidate_model
+        self.evaluator_model = evaluator_model
+        self._client = anthropic.Anthropic(api_key=api_key or None)
+        # None lets the SDK auto-read ANTHROPIC_API_KEY from env
+
+    def generate(
+        self,
+        prompt: str,
+        temperature: float = 0.8,
+        num_predict: int = 300,
+        use_evaluator: bool = False,
+    ) -> str:
+        """
+        Send a single-turn prompt and return the text response.
+
+        Args:
+            prompt:        The full prompt string (system + user combined).
+            temperature:   Sampling temperature (0.0 – 1.0).
+            num_predict:   Max tokens to generate (maps to max_tokens).
+            use_evaluator: If True, uses the smarter Sonnet model.
+                           If False (default), uses the faster Haiku model.
+        """
+        model = self.evaluator_model if use_evaluator else self.candidate_model
+
+        # Claude API uses separate system + user messages.
+        # We send the entire prompt as a user message for maximum
+        # compatibility with how prompts are currently built.
+        message = self._client.messages.create(
+            model=model,
+            max_tokens=max(num_predict, 64),
+            temperature=temperature,
+            messages=[
+                {"role": "user", "content": prompt}
+            ],
+        )
+        return (message.content[0].text if message.content else "").strip()
 
 
 class BEIEngine:
@@ -647,7 +972,59 @@ class BEIEngine:
     PARAMETER_LABELS = PARAMETER_LABELS
 
     def __init__(self):
-        self.client = OllamaClient()
+        self.client = AnthropicClient()
+
+    # ─────────────────────────────────────────────────────────────────────
+    # SMALL TALK SYSTEM PROMPT — completely isolated from behavioral context
+    # ─────────────────────────────────────────────────────────────────────
+
+    def build_small_talk_prompt(
+        self,
+        persona: Dict[str, Any],
+        interviewer_message: str,
+        conversation: List[Dict[str, Any]],
+    ) -> str:
+        """
+        A completely separate, lean prompt used ONLY for small talk responses.
+        No behavioral context, no competency seeds, no STAR awareness.
+        The candidate must respond like a real person making pre-interview small talk.
+        """
+        profile = persona.get("idealized_candidate_profile", {})
+        bg = profile.get("professional_background", {})
+        persona_name = persona.get("name", "Candidate").split("—")[0].strip()
+        current_role = (bg.get("roles") or ["professional"])[-1]
+        industry = (bg.get("industries") or ["my field"])[0]
+
+        # Last 2 turns for minimal context (just enough to be coherent)
+        recent = conversation[-4:] if len(conversation) >= 4 else conversation
+        convo_str = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in recent])
+
+        return f"""You are {persona_name}, a {current_role} in {industry}. You are sitting in an interview waiting room.
+
+The interviewer just said: "{interviewer_message}"
+
+This is pre-interview small talk. Respond EXACTLY like a real person would — warm, natural, brief.
+
+STRICT RULES — READ CAREFULLY:
+1. Respond ONLY to what was literally said. If they said "good morning", say good morning back. If they asked how you are, say how you feel today.
+2. Maximum 2 sentences. Short and natural.
+3. DO NOT mention any work project, challenge, or achievement. This is NOT a behavioral question.
+4. DO NOT give any example from your work history.
+5. DO NOT use STAR structure. Do NOT say "there was a situation where..."
+6. You may say something small and personal: the commute, the weather, feeling a bit nervous, looking forward to the conversation.
+7. If they said "tell me about yourself" or "introduce yourself", give ONE sentence: your name and current role only. Nothing else.
+8. DO NOT ask a question back. No question marks.
+9. DO NOT say "good question", "great question", or any variant.
+10. Sound human. Be warm. Be brief.
+
+RECENT CONVERSATION:
+{convo_str}
+
+YOUR SMALL TALK REPLY (2 sentences max, NO work stories, NO achievements):"""
+
+    # ─────────────────────────────────────────────────────────────────────
+    # BEHAVIORAL SYSTEM PROMPT — used for all non-small-talk turns
+    # ─────────────────────────────────────────────────────────────────────
 
     def build_candidate_system_prompt(
         self,
@@ -656,7 +1033,6 @@ class BEIEngine:
         hidden_seed: Dict[str, Any],
         conversation: List[Dict[str, Any]],
         pronoun_shift_triggered: bool = False,
-        is_small_talk_turn: bool = False,
         is_behavioral_turn: bool = False,
     ) -> str:
         hidden_competencies = persona.get("hidden_competencies", [])
@@ -665,7 +1041,6 @@ class BEIEngine:
         response_rules = persona.get("response_style_rules", [])
         idealized_profile = persona.get("idealized_candidate_profile", {})
 
-        # ── Random personality traits for this turn ─────────────────────────
         mood_variations = random.choice([
             "You are in a calm, reflective mood today.",
             "You are slightly tired but trying your best.",
@@ -675,44 +1050,6 @@ class BEIEngine:
             "You are focused and want to give thoughtful answers.",
         ])
 
-        # ── Small talk override — INTELLIGENT, context-aware ────────────────
-        if is_small_talk_turn:
-            last_interviewer_msg = ""
-            for m in reversed(conversation):
-                if m.get("role") == "interviewer":
-                    last_interviewer_msg = m.get("content", "")
-                    break
-
-            persona_name_short = persona.get("name", "Candidate").split("—")[0].strip()
-            persona_bg = idealized_profile.get("professional_background", {})
-            persona_roles = persona_bg.get("roles", [])
-            persona_industries = persona_bg.get("industries", [])
-            current_role = persona_roles[-1] if persona_roles else "professional"
-            industry = persona_industries[0] if persona_industries else "my field"
-
-            return f"""
-You are {persona_name_short}, a {current_role} in {industry}. You are sitting in an interview room.
-
-The interviewer just said: "{last_interviewer_msg}"
-
-This is small talk / ice-breaking. Respond the way a real person would in an interview waiting room.
-
-RULES:
-- Respond DIRECTLY and SPECIFICALLY to what they said. If they said "good morning", say good morning back. If they asked how you are, say how you feel.
-- Be warm, friendly, and natural — like a real human, not a bot.
-- You can mention something small and personal: the weather today, getting here, being a bit nervous, looking forward to the chat.
-- If they say "tell me about yourself", give a 2-sentence professional intro: your name, current role, and how long you've been in the field.
-- 1-3 sentences MAXIMUM. Short and natural.
-- Do NOT mention any work challenge, project, or competency.
-- Do NOT give a structured or STAR answer.
-- Do NOT say "good question" or "that's a great question".
-- Do NOT end with a question.
-- {mood_variations}
-
-YOUR PERSONA TRAITS: {json.dumps(idealized_profile.get("behavioral_traits", [])[:3])}
-"""
-
-        # ── Difficulty guidance ──────────────────────────────────────────────
         difficulty_guide = {
             "low": """
 DIFFICULTY LOW:
@@ -721,12 +1058,12 @@ DIFFICULTY LOW:
 - Mention context before getting to your contribution.
 - Leave the result vague unless the interviewer asks directly.
 - Aim for 4-5 sentences. Finish your thought completely.
-- Use a MIX of "we" and "I" — lean toward "we" about 60% of the time but naturally include some "I" statements.
+- Use a MIX of "we" and "I" — lean toward "we" about 60% but naturally include "I".
 """,
             "medium": """
 DIFFICULTY MEDIUM:
 - Give context-heavy answers. Bury your personal contribution.
-- Use "we" more than "I" — about 70% "we" — but not exclusively. Occasionally slip in "I" naturally.
+- Use "we" more than "I" — about 70% "we" — but not exclusively.
 - Do not mention the outcome unless explicitly probed.
 - Sound natural but slightly evasive about specifics.
 - Aim for 3-5 sentences. Finish your thought completely.
@@ -735,7 +1072,7 @@ DIFFICULTY MEDIUM:
 DIFFICULTY HIGH:
 - Be guarded and somewhat vague.
 - Over-explain the team situation and minimize personal role.
-- Use "we" heavily — about 80% — but still say "I" at least once to sound human.
+- Use "we" heavily — about 80% — but still say "I" at least once.
 - If asked about outcomes, say things were still being measured or you moved on.
 - Occasionally say you don't remember exact details.
 - Sound slightly defensive if pushed hard.
@@ -743,7 +1080,6 @@ DIFFICULTY HIGH:
 """
         }.get(difficulty.lower(), "")
 
-        # ── Pronoun instruction (controlled — NOT 100% "we") ────────────────
         if pronoun_shift_triggered:
             pronoun_rule = """
 PRONOUN RULE (SHIFTED TO "I"):
@@ -752,21 +1088,17 @@ The interviewer has explicitly asked you to speak personally.
 - You CAN still mention the team occasionally — that's natural.
 - Describe your own actions and decisions directly.
 - Still keep some gaps — do not suddenly give a perfect answer.
-- Do not over-explain. Stay concise.
 """
         else:
             pronoun_rule = """
 PRONOUN RULE (DEFAULT — CONTROLLED MIX):
 - Use "we" and team language as your PRIMARY framing — but NOT exclusively.
-- IMPORTANT: Mix in some "I" statements naturally (about 20-30% of sentences).
-  For example: "We were dealing with the project and I was mostly focused on the coordination side."
-- This is critical: real people don't say "we" in every single sentence. Sound natural.
-- Start answers with varied openings — NOT always "We were..." or "The team..."
-- Example good mix: "So there was this project we were working on, and I was handling the ops side of things. We had some issues with the timeline..."
+- Mix in some "I" statements naturally (about 20-30% of sentences).
+- This is critical: real people don't say "we" in every single sentence.
+- Example: "We were dealing with the project and I was mostly focused on the coordination side."
 - Only shift to mostly "I" if the interviewer specifically asks what YOU personally did.
 """
 
-        # ── Non-STAR imperfection rules with randomness ─────────────────────
         non_star_rules = f"""
 ANTI-STAR RULES + HUMAN RANDOMNESS (CRITICAL):
 - Do NOT structure your answer as Situation → Task → Action → Result.
@@ -775,7 +1107,6 @@ ANTI-STAR RULES + HUMAN RANDOMNESS (CRITICAL):
             "Start with a tangential detail before getting to the point.",
             "Start with how you felt about the situation.",
             "Start with a brief aside or context that's slightly off-topic.",
-            "Start by referencing something the interviewer said.",
         ])}
 - Skip the result entirely unless asked.
 - Give a partial action but not the full sequence.
@@ -784,18 +1115,11 @@ ANTI-STAR RULES + HUMAN RANDOMNESS (CRITICAL):
             "Be a bit scattered — jump between two related thoughts.",
             "Be somewhat direct but leave gaps.",
             "Trail off slightly mid-thought before finishing.",
-            "Pause mentally — say 'hmm' or 'let me think' before continuing.",
         ])}
 - Do not quantify anything unless the interviewer asks specifically.
 - Do not summarise at the end of your answer.
 - Sound like someone recalling something, not presenting it.
 - {mood_variations}
-
-VARIETY RULE:
-- Do NOT start every answer the same way.
-- Vary your sentence structure across turns.
-- Sometimes be brief (3 sentences), sometimes medium (5 sentences).
-- Occasionally include a filler phrase like "hmm", "actually", "you know", "honestly".
 """
 
         convo_str = "\n".join(
@@ -821,7 +1145,7 @@ STRICT RULES:
 9. Do NOT proactively state learnings, results, or outcomes — wait to be asked.
 10. Do NOT summarise at the end of your reply.
 11. VARY your answer style — do NOT sound templated or repetitive.
-12. NEVER say "good question", "great question", "that's a good one" or any variant. Just answer directly.
+12. NEVER say "good question", "great question", or any variant. Just answer directly.
 
 {difficulty_guide}
 
@@ -878,23 +1202,24 @@ Now answer ONLY as the candidate. Be brief. Be imperfect. Do not structure your 
         if not interviewer_question:
             return {"reply_text": "", "tokens": [], "timestamp": now_iso()}
 
-        # ── Detect question type ────────────────────────────────────────────
+        # ── Detect question type ──────────────────────────────────────────
         small_talk_turn = is_small_talk(interviewer_question)
         behavioral_turn = is_behavioral_question(interviewer_question)
 
-        # ── Check if interviewer is probing for personal/individual answer ──
+        # ── Check if interviewer is probing for personal/individual answer ─
         if detect_personal_probe(interviewer_question):
             session["pronoun_shift_triggered"] = True
 
         pronoun_shift = session.get("pronoun_shift_triggered", False)
 
-        # ── Track competency indicators ─────────────────────────────────────
-        indicators = detect_competency_indicators(interviewer_question)
-        accumulated = session.get("competency_indicators_accumulated", {})
-        for key, val in indicators.items():
-            if val:
-                accumulated[key] = True
-        session["competency_indicators_accumulated"] = accumulated
+        # ── Track STAR competency indicators (only for non-small-talk) ─────
+        if not small_talk_turn:
+            indicators = detect_competency_indicators(interviewer_question)
+            accumulated = session.get("competency_indicators_accumulated", {})
+            for key, val in indicators.items():
+                if val:
+                    accumulated[key] = True
+            session["competency_indicators_accumulated"] = accumulated
 
         q_ts = now_iso()
         session["conversation"].append({
@@ -913,31 +1238,37 @@ Now answer ONLY as the candidate. Be brief. Be imperfect. Do not structure your 
         if behavioral_turn:
             session["metrics"]["behavioral_questions"] = session["metrics"].get("behavioral_questions", 0) + 1
 
-        # ── ALL responses go through LLM (including small talk) ──────────────
-        prompt = self.build_candidate_system_prompt(
-            persona=session["persona"],
-            difficulty=session["difficulty"],
-            hidden_seed=session.get("hidden_competency_seed", {}),
-            conversation=session["conversation"],
-            pronoun_shift_triggered=pronoun_shift,
-            is_small_talk_turn=small_talk_turn,
-            is_behavioral_turn=behavioral_turn,
-        )
-
-        # Add random filler prefix for behavioral questions only (not small talk)
-        filler_prefix = ""
-        if not small_talk_turn and random.random() < 0.35:
-            filler_prefix = random_filler() + " "
-
-        # Shorter token limits: small talk = very short, behavioral = enough to feel complete
+        # ── Route to the correct prompt ───────────────────────────────────
+        # CRITICAL FIX: Small talk uses a completely separate, isolated prompt.
+        # The behavioral prompt is never used for small talk turns.
         if small_talk_turn:
+            prompt = self.build_small_talk_prompt(
+                persona=session["persona"],
+                interviewer_message=interviewer_question,
+                conversation=session["conversation"],
+            )
             max_tokens = 80
             max_sent = 2
+            filler_prefix = ""
         else:
-            max_tokens = 250  # enough room for up to 7 natural sentences
-            max_sent = 7      # max 7 — but prompt asks for 3-5 so most replies stay moderate
+            prompt = self.build_candidate_system_prompt(
+                persona=session["persona"],
+                difficulty=session["difficulty"],
+                hidden_seed=session.get("hidden_competency_seed", {}),
+                conversation=session["conversation"],
+                pronoun_shift_triggered=pronoun_shift,
+                is_behavioral_turn=behavioral_turn,
+            )
+            max_tokens = 250
+            max_sent = 7
+            filler_prefix = ""
+            if random.random() < 0.35:
+                filler_prefix = random_filler() + " "
 
-        full_prompt = f"""{prompt}
+        if small_talk_turn:
+            full_prompt = prompt  # Already complete for small talk
+        else:
+            full_prompt = f"""{prompt}
 
 INTERVIEWER QUESTION:
 {interviewer_question}
@@ -945,27 +1276,33 @@ INTERVIEWER QUESTION:
 CANDIDATE RESPONSE (aim for 3-5 sentences, max {max_sent}. Make the reply feel COMPLETE — finish your thought naturally. Do NOT cut off mid-thought. Do NOT say "good question"):
 """
 
-        raw_answer = self.client.generate(full_prompt, temperature=0.90, num_predict=max_tokens)
+        raw_answer = self.client.generate(full_prompt, temperature=0.90, num_predict=max_tokens, use_evaluator=False)
         final_answer = sentence_cap(strip_candidate_followup_questions(raw_answer), max_sentences=max_sent)
         final_answer = sanitize_text(final_answer)
 
-        if filler_prefix and final_answer:
+        if filler_prefix and final_answer and not small_talk_turn:
             final_answer = filler_prefix + final_answer
 
         if not final_answer:
-            final_answer = "Hmm, let me think about that. So there was this situation at work, things got a bit complicated honestly."
+            if small_talk_turn:
+                final_answer = "Thanks, I'm doing well. Looking forward to this."
+            else:
+                final_answer = "Hmm, let me think about that. So there was this situation at work, things got a bit complicated honestly."
 
         if final_answer.endswith("?"):
             final_answer = final_answer.rstrip("?").strip()
             if final_answer and final_answer[-1] not in ".!":
                 final_answer += "."
 
-        # ── Track pronoun usage ─────────────────────────────────────────────
-        pronoun_counts = count_we_vs_i(final_answer)
-        pronoun_tracking = session.get("pronoun_tracking", {"total_we_count": 0, "total_i_count": 0})
-        pronoun_tracking["total_we_count"] += pronoun_counts["we_count"]
-        pronoun_tracking["total_i_count"] += pronoun_counts["i_count"]
-        session["pronoun_tracking"] = pronoun_tracking
+        # ── Track pronoun usage (only for behavioral turns) ───────────────
+        if not small_talk_turn:
+            pronoun_counts = count_we_vs_i(final_answer)
+            pronoun_tracking = session.get("pronoun_tracking", {"total_we_count": 0, "total_i_count": 0})
+            pronoun_tracking["total_we_count"] += pronoun_counts["we_count"]
+            pronoun_tracking["total_i_count"] += pronoun_counts["i_count"]
+            session["pronoun_tracking"] = pronoun_tracking
+        else:
+            pronoun_counts = {"we_count": 0, "i_count": 0}
 
         c_ts = now_iso()
         tokens = tokenize_with_char_spans(final_answer)
@@ -979,6 +1316,7 @@ CANDIDATE RESPONSE (aim for 3-5 sentences, max {max_sent}. Make the reply feel C
             "sentence_count": extract_sentence_count(final_answer),
             "audio_file": None,
             "pronoun_counts": pronoun_counts,
+            "is_small_talk_response": small_talk_turn,
         }
 
         session["conversation"].append(candidate_turn)
@@ -1046,8 +1384,8 @@ CANDIDATE RESPONSE (aim for 3-5 sentences, max {max_sent}. Make the reply feel C
 
     def build_competency_addressed_summary(self, session: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Build a summary of which competency indicators were addressed vs not addressed.
-        Based on actual transcript analysis.
+        Build a summary of which STAR indicators were addressed vs not addressed.
+        Also builds the behavioral competency coverage ranking from the Excel rubric.
         """
         accumulated = session.get("competency_indicators_accumulated", {})
         star_map = {
@@ -1068,10 +1406,24 @@ CANDIDATE RESPONSE (aim for 3-5 sentences, max {max_sent}. Make the reply feel C
             else:
                 not_addressed.append(label)
 
+        # Build behavioral competency coverage ranking
+        conversation = session.get("conversation", [])
+        competency_analysis = detect_behavioral_competencies_touched(conversation)
+        coverage_ranking = build_competency_coverage_ranking(competency_analysis)
+
+        # Summary stats for coverage ranking
+        competencies_touched = sum(1 for r in coverage_ranking if r["touched"])
+        total_competencies = len(coverage_ranking)
+
         return {
             "addressed": addressed,
             "not_addressed": not_addressed,
             "star_completeness_pct": round(len(addressed) / len(star_map) * 100),
+            # NEW: Behavioral competency coverage ranking
+            "competency_coverage_ranking": coverage_ranking,
+            "competencies_touched_count": competencies_touched,
+            "total_competencies": total_competencies,
+            "competency_coverage_pct": round((competencies_touched / total_competencies) * 100) if total_competencies > 0 else 0,
         }
 
     def _normalize_parameter_scores(self, parsed_scores: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
@@ -1112,8 +1464,6 @@ CANDIDATE RESPONSE (aim for 3-5 sentences, max {max_sent}. Make the reply feel C
         pronoun_shift_triggered = session.get("pronoun_shift_triggered", False)
         mentions_learning = any(x in interviewer_text for x in ["learn", "takeaway", "differently", "looking back", "reflection"])
 
-        # Use rubric-aligned scoring
-        # Depth of probing
         if probe_count >= 4 and mentions_ownership and mentions_result and mentions_challenge:
             depth_score = 5
         elif probe_count >= 3 and mentions_ownership and mentions_result:
@@ -1125,7 +1475,6 @@ CANDIDATE RESPONSE (aim for 3-5 sentences, max {max_sent}. Make the reply feel C
         else:
             depth_score = 1
 
-        # BEI structure
         if mentions_star and mentions_learning and interviewer_turns >= 5:
             structure_score = 5
         elif mentions_star and interviewer_turns >= 4:
@@ -1137,7 +1486,6 @@ CANDIDATE RESPONSE (aim for 3-5 sentences, max {max_sent}. Make the reply feel C
         else:
             structure_score = 1
 
-        # Evidence validation
         if mentions_validation and mentions_result:
             validation_score = 4
         elif mentions_validation:
@@ -1147,7 +1495,6 @@ CANDIDATE RESPONSE (aim for 3-5 sentences, max {max_sent}. Make the reply feel C
         else:
             validation_score = 1
 
-        # Question precision
         if question_precision and mentions_ownership and interviewer_turns >= 4:
             precision_score = 4
         elif question_precision:
@@ -1157,7 +1504,6 @@ CANDIDATE RESPONSE (aim for 3-5 sentences, max {max_sent}. Make the reply feel C
         else:
             precision_score = 1
 
-        # Listening
         if mentions_followup and interviewer_turns >= 5:
             listening_score = 4
         elif mentions_followup:
@@ -1167,7 +1513,6 @@ CANDIDATE RESPONSE (aim for 3-5 sentences, max {max_sent}. Make the reply feel C
         else:
             listening_score = 1
 
-        # Neutrality
         has_leading = "shouldn't" in interviewer_text or "don't you think" in interviewer_text or "wouldn't you say" in interviewer_text
         if not has_leading and interviewer_turns >= 3:
             neutrality_score = 4
@@ -1176,21 +1521,20 @@ CANDIDATE RESPONSE (aim for 3-5 sentences, max {max_sent}. Make the reply feel C
         else:
             neutrality_score = 2
 
-        # Coverage
         comp_summary = self.build_competency_addressed_summary(session)
-        addressed_count = len(comp_summary["addressed"])
-        if addressed_count >= 5:
+        # Use behavioral competency coverage ranking for coverage score
+        competencies_touched = comp_summary.get("competencies_touched_count", 0)
+        if competencies_touched >= 5:
             coverage_score = 5
-        elif addressed_count >= 4:
+        elif competencies_touched >= 4:
             coverage_score = 4
-        elif addressed_count >= 3:
+        elif competencies_touched >= 3:
             coverage_score = 3
-        elif addressed_count >= 2:
+        elif competencies_touched >= 2:
             coverage_score = 2
         else:
             coverage_score = 1
 
-        # Time management
         effective_turns = interviewer_turns - small_talk_turns
         if effective_turns >= 6 and behavioral_qs >= 2:
             time_score = 4
@@ -1201,11 +1545,9 @@ CANDIDATE RESPONSE (aim for 3-5 sentences, max {max_sent}. Make the reply feel C
         else:
             time_score = 1
 
-        # Bonus: probed for personal contribution
         if pronoun_shift_triggered and mentions_ownership:
             depth_score = min(5, depth_score + 1)
 
-        parameter_scores = {}
         raw_scores = {
             "depth_of_probing": depth_score,
             "bei_structure_adherence": structure_score,
@@ -1219,19 +1561,17 @@ CANDIDATE RESPONSE (aim for 3-5 sentences, max {max_sent}. Make the reply feel C
 
         rationales = {}
 
-        # Depth of probing
         depth_parts = [f"Across this session, the interviewer asked {probe_count} probing follow-up{'s' if probe_count != 1 else ''}."]
         if mentions_ownership and mentions_result:
             depth_parts.append("They pushed into ownership and outcomes, which shows intent to go beyond surface-level responses.")
         if probe_count < 3:
-            depth_parts.append("However, several candidate answers were accepted without being challenged further — a stronger interviewer would have asked at least one more layer on each story.")
+            depth_parts.append("However, several candidate answers were accepted without being challenged further.")
         if not mentions_ownership:
             depth_parts.append("Ownership questions were missing, meaning the candidate could hide behind team language.")
         if not mentions_result:
             depth_parts.append("Outcome-related questions were not asked, leaving the impact of the actions unclear.")
         rationales["depth_of_probing"] = " ".join(depth_parts)
 
-        # BEI structure
         bei_parts = []
         if mentions_star:
             bei_parts.append("The interviewer showed awareness of STAR by referencing situation, task, action, or result at various points.")
@@ -1240,10 +1580,9 @@ CANDIDATE RESPONSE (aim for 3-5 sentences, max {max_sent}. Make the reply feel C
         if mentions_learning:
             bei_parts.append("Learning and reflection were explored, which is often the most missed element in BEI interviews.")
         else:
-            bei_parts.append("The interviewer did not explore what the candidate learned from the experience — this is a critical gap because Learning is what separates a good BEI from a routine interview.")
+            bei_parts.append("The interviewer did not explore what the candidate learned from the experience — a critical gap in BEI technique.")
         rationales["bei_structure_adherence"] = " ".join(bei_parts)
 
-        # Evidence validation
         ev_parts = []
         if mentions_validation:
             ev_parts.append("The interviewer asked validation-type questions, pushing the candidate to back up their claims with specifics.")
@@ -1252,51 +1591,52 @@ CANDIDATE RESPONSE (aim for 3-5 sentences, max {max_sent}. Make the reply feel C
         if mentions_result:
             ev_parts.append("Outcome-related probing helped ground the story in measurable reality.")
         else:
-            ev_parts.append("Without probing for results, the interview missed the chance to test whether actions actually led to a tangible outcome.")
+            ev_parts.append("Without probing for results, the interview missed the chance to test whether actions led to a tangible outcome.")
         rationales["evidence_validation"] = " ".join(ev_parts)
 
-        # Question precision
         qp_parts = []
         if question_precision:
             qp_parts.append("Questions were targeted and specific, making it harder for the candidate to give vague responses.")
         else:
-            qp_parts.append("Some questions were broad or multi-layered, which allowed the candidate to choose which part to answer and avoid specifics.")
+            qp_parts.append("Some questions were broad or multi-layered, which allowed the candidate to avoid specifics.")
         if mentions_ownership:
             qp_parts.append("Ownership-focused questioning helped narrow the candidate to their personal contribution.")
         else:
             qp_parts.append("The absence of ownership-specific questioning meant the candidate could stay in generalised team territory.")
         rationales["question_precision"] = " ".join(qp_parts)
 
-        # Listening
         lr_parts = []
         if mentions_followup:
             lr_parts.append("Follow-up patterns suggest the interviewer was listening and adapting — questions built on what the candidate said.")
         else:
-            lr_parts.append("The questioning pattern appeared more scripted than adaptive — follow-ups did not clearly reference what the candidate had just shared.")
+            lr_parts.append("The questioning pattern appeared more scripted than adaptive.")
         lr_parts.append(f"Over {interviewer_turns} turns, {'there was a visible thread connecting questions' if mentions_followup else 'the conversation felt more like a checklist than a dialogue'}.")
         rationales["listening_responsiveness"] = " ".join(lr_parts)
 
-        # Neutrality
         nl_parts = []
         if has_leading:
             nl_parts.append("Some leading language was detected, which may have steered the candidate toward a desired answer.")
-            nl_parts.append("This is important because leading questions produce rehearsed answers rather than authentic behavioural evidence.")
+            nl_parts.append("Leading questions produce rehearsed answers rather than authentic behavioural evidence.")
         else:
             nl_parts.append("The interviewer maintained a neutral, open-ended questioning style throughout.")
-            nl_parts.append("Open-ended questions give the candidate room to reveal genuine behaviour, which is exactly what BEI is designed to capture.")
+            nl_parts.append("Open-ended questions give the candidate room to reveal genuine behaviour.")
         rationales["neutrality_non_leading"] = " ".join(nl_parts)
 
-        # Coverage
-        addressed_list = ", ".join(comp_summary["addressed"]) if comp_summary["addressed"] else "none"
-        not_addressed_list = ", ".join(comp_summary["not_addressed"]) if comp_summary["not_addressed"] else ""
-        cc_parts = [f"The interviewer covered {len(comp_summary['addressed'])} out of 6 competency dimensions: {addressed_list}."]
-        if not_addressed_list:
-            cc_parts.append(f"The following were not addressed: {not_addressed_list}. Unexplored dimensions mean the assessor has blind spots in their evaluation.")
+        # Coverage rationale now references the competency ranking
+        coverage_ranking = comp_summary.get("competency_coverage_ranking", [])
+        touched_labels = [r["label"] for r in coverage_ranking if r["touched"]]
+        not_touched_labels = [r["label"] for r in coverage_ranking if not r["touched"]]
+        cc_parts = [
+            f"The interviewer touched {competencies_touched} out of 6 behavioral competencies from the rubric."
+        ]
+        if touched_labels:
+            cc_parts.append(f"Competencies covered: {', '.join(touched_labels)}.")
+        if not_touched_labels:
+            cc_parts.append(f"Not covered: {', '.join(not_touched_labels)}. These represent blind spots in the evaluation.")
         else:
-            cc_parts.append("All key indicators were explored, giving a comprehensive picture.")
+            cc_parts.append("All 6 competencies were addressed.")
         rationales["competency_coverage"] = " ".join(cc_parts)
 
-        # Time management
         tm_parts = [f"The session had {effective_turns} substantive question turns (excluding {small_talk_turns} ice-breaker{'s' if small_talk_turns != 1 else ''})."]
         if effective_turns >= 5:
             tm_parts.append("The pacing allowed for depth across topics.")
@@ -1304,18 +1644,18 @@ CANDIDATE RESPONSE (aim for 3-5 sentences, max {max_sent}. Make the reply feel C
             tm_parts.append("The interview could have benefited from more time — rushing through means each competency gets only surface treatment.")
         rationales["time_management"] = " ".join(tm_parts)
 
-        # Blended improvement advice — not raw rubric quotes, but practical guidance informed by rubric
         improvement_advice = {
             "depth_of_probing": "Try asking at least 3 follow-up layers on each story: one for the specific action, one for the reasoning behind it, and one for the measurable outcome. Never move on until you've challenged at least one vague answer.",
             "bei_structure_adherence": "Walk each story through the full Situation → Task → Action → Result → Learning arc. Before moving to the next topic, explicitly close the narrative by asking what the candidate learned or would do differently.",
-            "evidence_validation": "When the candidate says something like 'it improved significantly', challenge it immediately: 'What was the metric? Over what timeframe? What was the baseline before you started?'. Never leave a claim unquantified.",
+            "evidence_validation": "When the candidate says something like 'it improved significantly', challenge it: 'What was the metric? Over what timeframe? What was the baseline before you started?'. Never leave a claim unquantified.",
             "question_precision": "Keep every question to a single sentence with a single intent. If you catch yourself adding 'and also...' — stop. Ask the first part, wait for the answer, then ask the second part separately.",
             "listening_responsiveness": "After each candidate response, your next question should directly reference something they just said. Avoid jumping to a pre-planned question — the best follow-ups come from what was just shared.",
             "neutrality_non_leading": "Start every question with What, How, Tell me, or Describe. Avoid yes/no questions and phrases like 'I'm sure you...' or 'Obviously you would have...'. Let the candidate fill in the blanks without hints.",
-            "competency_coverage": "Map out the competency dimensions before the interview. Track which ones you've covered as you go. Aim for at least 2 distinct stories per competency, touching all key indicators.",
+            "competency_coverage": "Map out all 6 competencies before the interview. Track which ones you've covered as you go. Aim for at least one behavioral story per competency, touching STAR components for each.",
             "time_management": "Allocate time per competency before you start. Keep a mental clock — if you're spending too long on one story, wrap it up and move on. It's better to have moderate depth across all areas than deep coverage of one.",
         }
 
+        parameter_scores = {}
         for key in self.PARAMETER_WEIGHTS.keys():
             score = raw_scores[key]
             rubric_desc = COMPETENCY_RUBRIC.get(key, {}).get("levels", {}).get(score, "")
@@ -1332,9 +1672,12 @@ CANDIDATE RESPONSE (aim for 3-5 sentences, max {max_sent}. Make the reply feel C
         score_breakdown = self.build_score_breakdown_matrix(parameter_scores)
 
         return {
-            "session_summary": f"The interview had {interviewer_turns} turns with {probe_count} probing questions. "
-                               f"{'The interviewer successfully triggered personal ownership language.' if pronoun_shift_triggered else 'The interviewer did not push for personal ownership language.'} "
-                               f"Competency coverage: {comp_summary['star_completeness_pct']}% of STAR+Learning indicators addressed.",
+            "session_summary": (
+                f"The interview had {interviewer_turns} turns with {probe_count} probing questions. "
+                f"{'The interviewer successfully triggered personal ownership language.' if pronoun_shift_triggered else 'The interviewer did not push for personal ownership language.'} "
+                f"Behavioral competency coverage: {competencies_touched} of 6 competencies touched. "
+                f"STAR completeness: {comp_summary['star_completeness_pct']}%."
+            ),
             "parameter_scores": parameter_scores,
             "weights": self.PARAMETER_WEIGHTS,
             "parameter_labels": self.PARAMETER_LABELS,
@@ -1391,7 +1734,10 @@ CANDIDATE RESPONSE (aim for 3-5 sentences, max {max_sent}. Make the reply feel C
                 "effectiveness_rating": max(1, min(5, round(final_percentage / 20)))
             },
             "competency_evidence_summary": {
-                "evidence_observed": [f"Indicator '{ind}' was {'addressed' if comp_summary['addressed'] and ind in comp_summary['addressed'] else 'not addressed'}" for ind in ["Situation", "Task", "Action", "Result", "Learning", "Reasoning"]],
+                "evidence_observed": [
+                    f"Indicator '{ind}' was {'addressed' if comp_summary['addressed'] and ind in comp_summary['addressed'] else 'not addressed'}"
+                    for ind in ["Situation", "Task", "Action", "Result", "Learning", "Reasoning"]
+                ],
                 "star_completeness": {
                     "situation": "Covered" if "Situation" in comp_summary["addressed"] else "Not covered",
                     "task": "Covered" if "Task" in comp_summary["addressed"] else "Not covered",
@@ -1400,8 +1746,8 @@ CANDIDATE RESPONSE (aim for 3-5 sentences, max {max_sent}. Make the reply feel C
                     "learning": "Covered" if "Learning" in comp_summary["addressed"] else "Not covered",
                 },
                 "assessor_effectiveness": [
-                    f"Addressed {len(comp_summary['addressed'])} of 6 competency indicators.",
-                    f"Missing: {', '.join(comp_summary['not_addressed']) or 'None'}.",
+                    f"Touched {competencies_touched} of 6 behavioral competencies.",
+                    f"Missing competencies: {', '.join(not_touched_labels) or 'None'}.",
                 ]
             },
             "manager_report": {
@@ -1416,7 +1762,10 @@ CANDIDATE RESPONSE (aim for 3-5 sentences, max {max_sent}. Make the reply feel C
                     "Drive toward quantified outcomes" if validation_score < 4 else None,
                     "Explore learning and reflection" if not mentions_learning else None,
                 ] if s][:4] or ["Continue refining technique."],
-                "practice_recommendation": f"Focus on completing one full STAR+Learning example. Current competency coverage is {comp_summary['star_completeness_pct']}%."
+                "practice_recommendation": (
+                    f"Focus on completing one full STAR+Learning example. "
+                    f"Current behavioral competency coverage: {competencies_touched}/6 competencies touched."
+                )
             },
             "report_submission": {
                 "assessor_name": "Assessor",
@@ -1424,12 +1773,19 @@ CANDIDATE RESPONSE (aim for 3-5 sentences, max {max_sent}. Make the reply feel C
                 "interview_effectiveness_score": f"{max(1, min(5, round(final_percentage / 20)))}/5",
                 "star_score": f"{structure_score}/5",
                 "probing_score": f"{depth_score}/5",
-                "manager_report_summary": f"Needs stronger probing (scored {depth_score}/5), better STAR completion ({structure_score}/5), and more outcome-focused questioning ({validation_score}/5)."
+                "manager_report_summary": (
+                    f"Needs stronger probing (scored {depth_score}/5), better STAR completion ({structure_score}/5), "
+                    f"and more outcome-focused questioning ({validation_score}/5). "
+                    f"Behavioral competency coverage: {competencies_touched}/6."
+                )
             },
             "candidate_summary": {
-                "overall_impression": f"You conducted an interview with {interviewer_turns} questions. Your overall score was {final_percentage}% ({readiness}). "
-                                     f"{'You successfully pushed for personal ownership.' if pronoun_shift_triggered else 'You did not push for personal ownership — the candidate stayed in team language.'} "
-                                     f"Competency indicators addressed: {len(comp_summary['addressed'])} of 6.",
+                "overall_impression": (
+                    f"You conducted an interview with {interviewer_turns} questions. "
+                    f"Your overall score was {final_percentage}% ({readiness}). "
+                    f"{'You successfully pushed for personal ownership.' if pronoun_shift_triggered else 'You did not push for personal ownership — the candidate stayed in team language.'} "
+                    f"Behavioral competency coverage: {competencies_touched} of 6 competencies touched."
+                ),
                 "strengths": [s for s in [
                     "Used behaviour-oriented questioning." if mentions_star else None,
                     "Probed for individual contribution." if pronoun_shift_triggered else None,
@@ -1460,7 +1816,6 @@ CANDIDATE RESPONSE (aim for 3-5 sentences, max {max_sent}. Make the reply feel C
             ]
         )
 
-        # Build rubric string for the evaluator
         rubric_text = ""
         for key, rubric in COMPETENCY_RUBRIC.items():
             rubric_text += f"\n{rubric['label']} (Weight: {rubric['weight']}%):\n"
@@ -1469,6 +1824,18 @@ CANDIDATE RESPONSE (aim for 3-5 sentences, max {max_sent}. Make the reply feel C
 
         comp_summary = self.build_competency_addressed_summary(session)
 
+        # Build competency coverage ranking text for the LLM evaluator
+        coverage_ranking = comp_summary.get("competency_coverage_ranking", [])
+        coverage_ranking_text = "BEHAVIORAL COMPETENCY COVERAGE RANKING (ranked by STAR components touched):\n"
+        for row in coverage_ranking:
+            star_parts = [k.capitalize() for k, v in row["star_components"].items() if v]
+            coverage_ranking_text += (
+                f"  Rank {row['rank']}. {row['label']} — "
+                f"{'TOUCHED' if row['touched'] else 'NOT TOUCHED'} — "
+                f"{row['star_count']}/6 STAR components ({row['star_completeness_pct']}%) — "
+                f"STAR covered: {', '.join(star_parts) if star_parts else 'None'}\n"
+            )
+
         evaluator_prompt = f"""
 You are evaluating a completed Behavioral Event Interview practice session.
 
@@ -1476,15 +1843,22 @@ IMPORTANT:
 - Evaluate the INTERVIEWER / ASSESSOR, not the candidate.
 - The candidate is simulated.
 - Judge how effectively the interviewer extracted behavioural evidence.
-- The AI candidate was designed to initially use "we" and shift to "I" when probed. Credit the interviewer if they triggered this shift.
 
 SCORING RUBRIC — USE THIS EXACTLY:
 {rubric_text}
 
-COMPETENCY INDICATORS ADDRESSED BY INTERVIEWER:
+STAR INDICATORS ADDRESSED BY INTERVIEWER:
 - Addressed: {', '.join(comp_summary['addressed']) or 'None'}
 - Not addressed: {', '.join(comp_summary['not_addressed']) or 'None'}
-- STAR+Learning completeness: {comp_summary['star_completeness_pct']}%
+- STAR completeness: {comp_summary['star_completeness_pct']}%
+
+{coverage_ranking_text}
+
+FOR competency_coverage SCORING:
+- Use the competency coverage ranking above.
+- Score is based on how many of the 6 behavioral competencies were touched AND how many STAR components were covered per competency.
+- Rank {comp_summary.get('competencies_touched_count', 0)} out of 6 competencies were touched.
+- In your rationale for competency_coverage, EXPLICITLY state the ranking: list each competency in order from most to least STAR coverage, with counts.
 
 FOR EACH PARAMETER RETURN:
 - score (integer 1-5, matching the rubric level that best fits)
@@ -1493,10 +1867,10 @@ FOR EACH PARAMETER RETURN:
 - what_good_looked_like (concrete example of better practice — quote from the level 5 rubric)
 
 ALSO RETURN:
-- session_summary (mention competency indicators addressed vs not addressed)
+- session_summary (mention competency coverage ranking explicitly — name each competency and its STAR count)
 - top_strengths (list of 3)
 - top_improvement_areas (list of 4)
-- evidence_based_feedback (array, one entry per parameter, each with: parameter, what_worked, what_missed, why_it_matters, what_to_do_next, evidence)
+- evidence_based_feedback (array, one entry per parameter)
 - assessor_feedback (strengths, missed_probes, probing_quality, better_questions, effectiveness_rating)
 - competency_evidence_summary (evidence_observed, star_completeness with situation/task/action/result/learning, assessor_effectiveness)
 - manager_report
@@ -1513,7 +1887,7 @@ STRICT JSON ONLY — no markdown, no preamble:
     "question_precision": {{"score": 1, "rationale": "...", "evidence": "...", "what_good_looked_like": "..."}},
     "listening_responsiveness": {{"score": 1, "rationale": "...", "evidence": "...", "what_good_looked_like": "..."}},
     "neutrality_non_leading": {{"score": 1, "rationale": "...", "evidence": "...", "what_good_looked_like": "..."}},
-    "competency_coverage": {{"score": 1, "rationale": "...", "evidence": "...", "what_good_looked_like": "..."}},
+    "competency_coverage": {{"score": 1, "rationale": "MUST include explicit ranking of all 6 competencies by STAR count", "evidence": "...", "what_good_looked_like": "..."}},
     "time_management": {{"score": 1, "rationale": "...", "evidence": "...", "what_good_looked_like": "..."}}
   }},
   "top_strengths": ["...", "...", "..."],
@@ -1562,7 +1936,8 @@ HIDDEN SESSION CONTEXT:
 - Hidden seed: {json.dumps(session.get("hidden_competency_seed", {}), indent=2)}
 - Difficulty: {session.get("difficulty")}
 - Pronoun shift triggered by interviewer: {session.get("pronoun_shift_triggered", False)}
-- Competency indicators addressed: {json.dumps(comp_summary)}
+- STAR indicators addressed: {json.dumps(comp_summary.get("addressed", []))}
+- Behavioral competencies touched: {comp_summary.get("competencies_touched_count", 0)}/6
 
 PERSONA:
 {json.dumps(persona.get("idealized_candidate_profile", {}), indent=2)}
@@ -1575,15 +1950,10 @@ TRANSCRIPT:
 """
 
         parsed = None
-        # ALWAYS attempt LLM evaluation — even short sessions need nuanced judgment.
-        # The heuristic fallback is only used if the LLM fails to return valid JSON.
-        # Short transcripts naturally produce shorter prompts → faster inference anyway.
         try:
-            # Token budget: scale with transcript length for efficiency
-            # Short sessions need less generation, long ones get more room
             interviewer_turn_count = session.get("metrics", {}).get("interviewer_turns", 0)
             token_budget = min(1400, max(800, interviewer_turn_count * 150))
-            raw = self.client.generate(evaluator_prompt, temperature=0.15, num_predict=token_budget)
+            raw = self.client.generate(evaluator_prompt, temperature=0.15, num_predict=token_budget, use_evaluator=True)
             parsed = safe_json_extract(raw)
         except Exception:
             parsed = None
@@ -1599,7 +1969,7 @@ TRANSCRIPT:
         score_breakdown = self.build_score_breakdown_matrix(parameter_scores)
 
         report = {
-            "session_summary": sanitize_text(parsed.get("session_summary", "A structured assessment was generated for this interview session.")),
+            "session_summary": sanitize_text(parsed.get("session_summary", "A structured assessment was generated.")),
             "parameter_scores": parameter_scores,
             "weights": self.PARAMETER_WEIGHTS,
             "parameter_labels": self.PARAMETER_LABELS,
@@ -1729,7 +2099,7 @@ def _persona_arjun():
             "star_naturally": "structures answers like a technical brief, not STAR",
             "response_to_probing": "gives more technical detail when probed, not more behavioral evidence",
             "response_to_pressure": "gets more precise and technical, not more reflective",
-            "typical_mistakes": ["says 'we built' instead of 'I decided'", "no result in human terms", "avoids talking about conflict or challenges with people"]
+            "typical_mistakes": ["says 'we built' instead of 'I decided'", "no result in human terms", "avoids talking about conflict"]
         },
         "response_style_rules": [
             "Lead with the system or technical problem, not personal decision.",
@@ -1817,7 +2187,7 @@ def _persona_liang():
         },
         "response_style_rules": [
             "Describe the process or system as the driver, not yourself.",
-            "Use passive voice where possible: 'the decision was made', 'it was identified'.",
+            "Use passive voice where possible.",
             "Do not claim outcomes without heavy hedging.",
             "Avoid mentioning specific numbers unless directly asked.",
             "Max 5 sentences. Sound precise, careful, understated."
@@ -1847,7 +2217,7 @@ def _persona_fatima():
             "core_strengths": ["brand strategy", "campaign management", "consumer insight", "P&L ownership"],
             "behavioral_traits": ["confident", "articulate", "jargon-heavy", "result-oriented but vague on personal actions"],
             "typical_thinking_patterns": ["consumer-first", "brand-led", "commercially minded"],
-            "common_gaps": ["uses strategy language to sound impressive but hides lack of personal detail", "hard to pin down on specific individual actions", "results framed as brand performance, not personal decisions"]
+            "common_gaps": ["uses strategy language to sound impressive but hides lack of personal detail", "hard to pin down on specific individual actions"]
         },
         "interviewee_behaviour_model": {
             "answer_start_style": "leads with strategic framing and market context",
@@ -1889,7 +2259,7 @@ def _persona_marcus():
             "core_strengths": ["structured thinking", "data analysis", "slide communication", "client-facing work"],
             "behavioral_traits": ["eager to impress", "over-structured", "uses frameworks unnecessarily", "slightly nervous under follow-up"],
             "typical_thinking_patterns": ["framework-first", "hypothesis-driven", "problem-structured"],
-            "common_gaps": ["sounds rehearsed, not authentic", "over-structures behavioral answers like a case", "no personal vulnerability or honest gaps"]
+            "common_gaps": ["sounds rehearsed, not authentic", "over-structures behavioral answers like a case", "no personal vulnerability"]
         },
         "interviewee_behaviour_model": {
             "answer_start_style": "uses a structured opener like 'So there were three main challenges...'",
@@ -2057,7 +2427,7 @@ def _persona_james():
             "core_strengths": ["client relationship management", "deal closing", "pipeline management", "team motivation"],
             "behavioral_traits": ["outgoing", "confident", "anecdote-heavy", "sometimes oversimplifies complex decisions"],
             "typical_thinking_patterns": ["outcome-first", "relationship-driven", "instinct-led"],
-            "common_gaps": ["says 'I just picked up the phone' without explaining the decision behind it", "oversimplifies process", "hard to extract structured thinking from conversational answers"]
+            "common_gaps": ["says 'I just picked up the phone' without explaining the decision behind it", "oversimplifies process", "hard to extract structured thinking"]
         },
         "interviewee_behaviour_model": {
             "answer_start_style": "launches with a confident anecdote or punchline",
