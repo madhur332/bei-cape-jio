@@ -1,0 +1,10 @@
+streamlit
+requests
+faster-whisper
+streamlit-mic-recorder
+python-dotenv
+streamlit
+requests
+speechrecognition
+plotly
+pandas
