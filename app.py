@@ -1,5 +1,6 @@
 # app.py
-# BEI Cape — Main entry point for multi-page Streamlit app
+# BEI Cape — Main entry point
+# Navigation is handled via the sidebar (Streamlit native multi-page)
 
 import streamlit as st
 
@@ -29,16 +30,14 @@ with col1:
         st.markdown("### 🎙️ Candidate Interview")
         st.write("Practice your BEI questioning technique with an AI candidate. Choose a persona, set difficulty, ask questions by voice, and get rubric-based feedback.")
         st.markdown("**For:** Interviewers / Assessors in training")
-        if st.button("Open Candidate Interview →", use_container_width=True, type="primary"):
-            st.switch_page("pages/candidate.py")
+        st.info("👈 Click **candidate** in the sidebar to open")
 
 with col2:
     with st.container(border=True):
         st.markdown("### 🔍 Assessor Review")
         st.write("Review completed interview sessions. Inspect rubric-based evaluations, competency coverage rankings, pronoun arc analysis, and detailed coaching feedback.")
         st.markdown("**For:** Trainers / Managers reviewing sessions")
-        if st.button("Open Assessor Review →", use_container_width=True):
-            st.switch_page("pages/assessor.py")
+        st.info("👈 Click **assessor** in the sidebar to open")
 
 st.markdown("---")
 st.caption("BEI Cape v3 — Powered by Claude API (Anthropic)")
